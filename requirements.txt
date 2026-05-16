@@ -1,0 +1,12 @@
+numpy
+matplotlib
+tqdm
+networkx
+
+# Optional — only needed by archetypes.py
+archepy
+
+# Optional GPU backend for main_vec.py — install whichever matches your CUDA:
+#   pip install cupy-cuda12x   # for CUDA 12.x
+#   pip install cupy-cuda11x   # for CUDA 11.x
+# CPU-only runs work without it.

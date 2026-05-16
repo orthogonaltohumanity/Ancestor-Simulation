@@ -9,24 +9,28 @@ A walkthrough of the simulation, code section by code section, with explanations
 `anthrosim` is a population-level agent simulation. Every agent runs a small interpreted program (a "decision graph") that decides what action they take each hour. Agents have:
 
 - **biological state** — hunger, cache, tired, age, in_camp, sleep, pregnancy
-- **a decision graph** — nodes referencing actions like `agent_eat`, `agent_forage`, `agent_propose_mate`, `agent_gift`, etc.
+- **a decision graph** — nodes referencing actions like `agent_eat`, `agent_forage`, `agent_propose_mate`, `agent_gift`, `agent_make_camp`, `agent_join_camp`, etc.
 - **social weights** — an 11-dim linear vector + 11×11 quadratic matrix used to rank other agents
 - **a family crest** — a 256-dim unit vector that makes kin recognizable and gates incest
+- **a camp affiliation** — `camp_id` int; mating, gifting, communication, and watching are restricted to within-camp pairs. Camps form/dissolve dynamically via `agent_make_camp` / `agent_join_camp`
 
 The hour-by-hour walk evaluates each agent's graph and produces actions. Mutation perturbs graphs; sexual reproduction averages parental weights and slerps parental crests; **memetic adoption** lets agents copy nodes from other agents into their own graphs. Selection prunes dysfunctional individuals. The whole system is designed to let cultural and behavioral patterns *emerge* from the basic mechanics.
 
-There are three Python files plus utilities:
+There are three core Python files plus tooling:
 
 | file | role |
 |---|---|
-| `main.py` | reference Python implementation + canonical decision graph + tunable constants |
-| `main_vec.py` | vectorized hot-loop using NumPy arrays for the per-hour walk |
-| `run_vec.py` | the actual driver that uses `main_vec` for hot work and `main` for object-graph operations |
-| `analyze.py` | text-mode reports over the dump JSON files (trajectory, cohorts, graphs) |
-| `viz.py` | matplotlib charts: family clusters, cohort cohesion, population pyramid, resource histograms, weight heatmap, population trajectory |
-| `archetypes.py` | multi-subject archetypal analysis (ArchePy) over agent weight vectors — finds K archetypal value-coalitions across the run history; supports a `--signed` flag that splits each weight into ± halves so AA can find archetypes in both directions |
+| `main.py` | **library**: tunable constants, agent/node classes, canonical decision graph builder, mutation, social ranking, serialization. **Not directly runnable** — has no sim loop; the CPU reference loop was removed once the vectorized path stabilized. |
+| `main_vec.py` | vectorized hot-loop: per-hour action dispatch, mating, watching, gifting, births, deaths, communication, sub-graph adoption. NumPy (or torch/cupy) arrays for all per-agent state. |
+| `run_vec.py` | **entry point**: imports `main as ref` for constants + graph utilities and `main_vec as v` for the hot loop. Owns founder init, burn-in, the hour-by-hour driver, mutation step, and dump cadence. |
+| `viz.py` | matplotlib charts: family clusters, cohort cohesion, population pyramid, resource histograms, weight heatmap, population trajectory, death-cause inference. |
+| `analyze.py` | text-mode summaries over the dump JSON files (trajectory, cohorts, graphs). |
+| `lineage_analysis.py` | population-genetics analyses on the memetic node-lineage system: SFS heatmap over time + selective-sweep trajectory detection. See §18. |
+| `archetypes.py` | multi-subject archetypal analysis (ArchePy) over agent weight vectors — finds K archetypal value-coalitions across run history. *Requires `pip install archepy` to run.* |
+| `graph_evo.py` | renders a single agent's decision graph as an animated gif across weekly dumps. *Requires `pip install networkx` to run.* |
+| `viz_canonical.py` | one-shot render of the canonical founder graph. Depends on `graph_evo.py` (needs networkx). |
 
-Run with `.venv/bin/python run_vec.py`. Tunables live at the top of `main.py`.
+Run with `python3 run_vec.py`. Tunables live at the top of `main.py`. Architecture rule of thumb: if you're editing simulation *semantics*, look in `main_vec.py`. If you're editing *constants, the canonical graph, mutation/clone logic, or social scoring*, look in `main.py`. If you're editing the *driver, init, or dump cadence*, look in `run_vec.py`.
 
 > **Note on line numbers.** Inline annotations like `(main.py:233)` in this doc were accurate at time of writing but drift as the codebase grows. Treat them as approximate pointers; trust function/class names over numeric refs. The constants in §1 are kept current with the canonical `main.py`.
 
@@ -56,25 +60,33 @@ ADAPTIVE_MUT_LOW  = 1.0 / (3 * 365.0 * 24.0)  # min mut rate (high-self-rank)
 LISTEN_ADOPT_P = 0.30                         # default; overridden by adaptive
 ADAPTIVE_ADOPT_HIGH = 1.0                     # low-self-rank cap (full copy)
 ADAPTIVE_ADOPT_LOW  = 0.001                   # high-self-rank floor (~never)
+
+# Cultural-memory parameters (see §9b)
+FRESHNESS_MAX = 168                           # hours = 7 days
+FRESHNESS_DECAY = 1                           # per hour
+GC_INTERVAL_HOURS = 24                        # daily GC sweep
 ```
 
 Per-hour probability that an agent's graph mutates / adopts. Both rates are **adaptive** — agents who self-rank below peer-mean (using their *own* social score function) hit `*_HIGH` (explore + copy), confident agents hit `*_LOW` (conserve genome). Mut interpolates in log-space, adopt linearly. See §14.
 
-### Social ranking features (11-dim)
+Each node also carries a per-agent freshness counter that ticks down by `FRESHNESS_DECAY` each hour and is reset to `FRESHNESS_MAX` whenever the agent's chain walk visits that slot. Nodes that go un-visited for the full window die at the next GC sweep. The chain still has them while alive; visiting them is what keeps them alive.
+
+### Social ranking features (12-dim)
 
 ```python
 SOCIAL_FEATURES = ('net_debt_flow', 'hunger', 'tired', 'is_female', 'cache',
                    'age', 'is_pregnant', 'is_menopausal',
                    'matings_with_target', 'gifts_with_target',
-                   'family_similarity')
-N_FEATURES = 11
+                   'family_similarity', 'target_camp_cache')
+N_FEATURES = 12
 ```
 
-Each agent has an **11-dim weight vector** + **11×11 Q matrix** for social ranking. The last three features are **observer-target pairwise** — they depend on both who's watching and who's being watched:
+Each agent has a **12-dim weight vector** + **12×12 Q matrix** for social ranking. The last four features are observer/target-conditional, not pure intrinsics of the target:
 
 - `matings_with_target` — symmetric pair count (decays per hour)
 - `gifts_with_target` — sum of bidirectional gift-flow kcal (decays per hour)
 - `family_similarity` — `cos(observer.crest, target.crest)` ∈ [−1, +1]
+- `target_camp_cache` — kcal in the camp the *target* belongs to (looked up via target's camp_id). Observer-independent in value but threaded through the same expand-with-pairwise pipeline. Lets agents prefer or avoid targets in well-stocked camps — and crucially, lets `join_camp` softmax distinguish camps by larder.
 
 ```python
 MATING_DECAY = 0.5 ** (1.0 / (30 * 24))      # 30-day half-life
@@ -83,6 +95,7 @@ GIFT_AMOUNT  = 1000                          # kcal moved per gift action
 GIFT_DECAY   = 0.5 ** (1.0 / (30 * 24))      # 30-day half-life
 GIFT_NORM    = 1.0 / 1000.0
 FAMILY_NORM  = 1.0                           # cosine is already in [-1, 1]
+CAMP_CACHE_NORM = 1e-6                       # 1M kcal larder → feature value 1.0
 ```
 
 ### Weight-mutation flavors
@@ -141,6 +154,25 @@ CAMP = {'cache': 0.0}                        # shared in-camp larder
 ```
 
 Both personal cache and `net_debt_flow` (signed deposit-vs-withdraw tally) decay. Without decay, ndf grew unbounded and broke the social-score sigmoid that gates adoption rates.
+
+### Resource pools (logistic-growth game/fish/plants)
+
+```python
+RESOURCE_K_HUNT   = 5_000_000.0   # carrying capacity (kcal) of game pool
+RESOURCE_K_FISH   = 5_000_000.0
+RESOURCE_K_GATHER = 5_000_000.0
+LOGISTIC_GROWTH_R = 0.005         # per-hour intrinsic growth (logistic r)
+MIN_RESOURCE_FRAC = 0.05          # pool can't fall below this fraction of K
+```
+
+Each forage type extracts from its own pool. Per-hour growth: `R += r * R * (1 - R/K)`. Pool depletion changes the harvest model in a real-world-inspired way:
+
+- **`agent_hunt` scales SUCCESS PROBABILITY by `R/K`**: a kill still yields a full carcass (`HUNT_YIELD`), but encounters are rarer when the pool is depleted ("animals get harder to find"). Effective fire rate is `HUNT_SUCCESS_P * (R/K)`.
+- **`agent_fish` and `agent_gather` scale YIELD by `R/K`**: catches are easy but small when stocks are low. Effective yield = `YIELD * seasonal * (R/K)`.
+
+Extraction is subtracted from R, clipped at the `MIN_RESOURCE_FRAC * K` floor. **Resources can never go extinct** — even under sustained over-harvest, the floor keeps the pool alive and the seasonal/logistic dynamics restore it once pressure relents.
+
+Held in the driver as a `resources = {'hunt': float, 'fish': float, 'gather': float}` dict, threaded through `step_all` → `_apply_actions`. Logistic growth applied once per hour via `resource_growth_step(resources)`. Persisted in dumps as `payload['resources']`.
 
 ### Seasonal forage scaling and per-action params
 
@@ -201,6 +233,11 @@ PREGNANCY_HOURS = 9 * 30 * 24      # 9-month mean
 PREGNANCY_HOURS_RANGE = 20 * 24    # ± stochastic spread
 PREGNANCY_FORAGE_FRACTION = 0.33   # forage permitted first 1/3 of pregnancy
 PREGNANCY_BIRTH_P = 0.75           # P(pregnancy | het mating)
+INIT_AGE_LO  = 0                   # founder age range
+INIT_AGE_HI  = 25
+INIT_AGE_DECAY_TAU = 8.0           # τ in years for truncated-exponential
+                                   # founder age distribution (smaller →
+                                   # more young founders). 0 → uniform.
 TWIN_BETA = 4.0                    # P(N+1 babies | N) = exp(-beta)
 MENOPAUSE_AGE = 40
 MENOPAUSE_BETA = 0.10
@@ -228,6 +265,8 @@ class chunk:                                                                    
 ```
 
 A single boolean predicate over agent state. E.g. `hunger > 250` is `var='hunger', op='>', value=250`. For boolean variables (`is_female`, `is_in_camp`, `sleep`) `op` is None and `value` is True/False/None (the None case means "just bool(state[var])").
+
+The pseudo-var **`rng`** draws a fresh uniform `[0, 1)` at evaluation time — used like `rng > 0.99` for a ~1%-per-visit stochastic gate. It's an ordered var (lives in `ORDERED_VARS`); mutation can drift its threshold by `FLOAT_DELTA['rng'] = 0.05` per step. Within a single `_eval_seqs` call all rng chunks see the same per-agent draw (correlated), so multi-chunk rng seqs in one node are perfectly correlated — not a problem for single-chunk gates.
 
 ### `class chunk_seq`
 
@@ -352,40 +391,17 @@ def eval_seq(seq, ag, hour):                                                    
 
 Left-fold: start with the first chunk's bool, combine with each subsequent chunk via the corresponding link operator. Note this is left-associative and has no precedence — a `chunk1 AND chunk2 OR chunk3` is parsed as `(chunk1 AND chunk2) OR chunk3`.
 
-### `step(ag, root, hour, budget)`
+### Per-hour walk
 
-```python
-def step(ag, root, hour, budget=MAX_ACTION):                                      (main.py:209-225)
-    n = root
-    visited = 0
-    visit_cost = NODE_VISIT_HUNGER * metabolic_scale(ag.age)
-    while n is not None and visited < budget:
-        visited += 1
-        ag.hunger += visit_cost
-        cond = eval_seq(n.seq, ag, hour)
-        action = n.true_action if cond else n.false_action
-        if action is not None:
-            action(ag)
-        if action is not agent_sleep:
-            ag.sleep = False
-            ag.consecutive_sleep = 0
-        n = n.true_node if cond else n.false_node
-```
+The per-hour CPU `step()` function that used to live in `main.py` has been **removed** — the vectorized `step_all` in `main_vec.py` is now the only runtime walker. `eval_seq` (and its inner `eval_chunk`) survive in `main.py` because the burn-in's solo-walk test (`run_vec.py:_burn_in_asex_cycle`) still uses them on individual agents.
 
-The reference (object-graph) walk. Each visit:
-1. accrue `visit_cost` hunger
-2. evaluate the seq
-3. fire the appropriate action
-4. reset sleep streak if action wasn't sleep
-5. advance to true_node or false_node
-
-Bounded by `budget = MAX_ACTION`. Note the vectorized version in `main_vec.py:step_all` does the same logic over all N agents at once.
+The conceptual per-visit cycle is unchanged: accrue `NODE_VISIT_HUNGER * metabolic_scale(age)` hunger, evaluate the seq, fire the appropriate action, reset sleep streak unless the action was `agent_sleep`, advance to `true_node` or `false_node`. See `main_vec.py:step_all` for the vectorized form.
 
 ---
 
 ## 5. Action functions (`main.py`)
 
-There are 16 actions (15 agent operations + `None` no-op). The most important ones:
+There are 16 actions (15 agent operations + `None` no-op). **Status note:** since the CPU `step()` was retired, the action function bodies in `main.py` are now `pass`-only stubs — they exist solely as identity markers in `ACTION_POOL` so mutation can pick/swap them and serialization can write their names. The actual *semantics* live in `main_vec.py:apply_actions` (line ~418+), which masks the population on the action enum (`A_SLEEP`, `A_EAT`, `A_FORAGE`, …) and applies the effect in bulk. The pseudocode below documents the intended behavior — `main_vec.py` is the source of truth.
 
 ### `agent_sleep`
 
@@ -464,7 +480,7 @@ def agent_deposit(ag):                                                          
     ag.net_debt_flow += amt
 ```
 
-Move kcal to/from the shared `CAMP` larder. **`net_debt_flow` is the bookkeeping variable** — positive = generous depositor, negative = chronic withdrawer. It feeds the `social_score` 1st feature, so depositors and withdrawers look "salient" to peers (and the quadratic Q term punishes large magnitudes in either direction).
+Move kcal to/from the agent's *own camp's* larder. The single legacy `CAMP` global in `main.py` is only consulted as a fallback inside `social_score`; the live multi-camp pipeline maintains per-camp caches as `camp_caches: dict[camp_id → float]` inside `main_vec.py`. **`net_debt_flow` is the bookkeeping variable** — positive = generous depositor, negative = chronic withdrawer. It feeds the `social_score` 1st feature, so depositors and withdrawers look "salient" to peers (and the quadratic Q term punishes large magnitudes in either direction).
 
 ### `agent_watch_children`
 
@@ -528,10 +544,10 @@ sleep[0..2] ──► watch[0..2] ──► leave_camp[0..2] ──► hunt ─�
                                                                           └─F─►   talk[0..2]
                               talk[0..2] ──► listen[0..2] ──► mate[0..2]
                                 ──► gift[0..2] ──► deposit[0..2] ──► withdraw[0..2]
-                                                                          │
-                                                                          ▼
-                                                           idle[0..2] ──► sleep_first  (loop)
+                                ──► join_camp[0..2] ──► make_camp[0..2] ──► idle[0..2] ──► tired_make_camp ──► sleep_first  (loop)
 ```
+
+`tired_make_camp` is the chain root: a single node fired once per cycle with seq `[is_in_camp == False, tired > 0.7]` (LINK_AND). When a wanderer gets tired they `make_camp` first, then on the next visit reach the sleep gate and pass out in the freshly-founded camp — the "build a bivouac before sleeping" rule. Affiliated agents pass straight through to sleep.
 
 Order: **forage runs FIRST, then eat**. After leaving camp, agents go hunt → fish → gather. The gather node branches: T (gathered something) → eat[0..8] (9 eat clones) → social phase; F (off-hours/etc) → straight to social phase. The 9 eat clones form a long eat chain so any cached agent gets several attempts to convert cache → fed.
 
@@ -722,8 +738,10 @@ The reference Python walk is too slow for N=1500 over 2000 sim-years. `main_vec.
 ### Flat graph layout
 
 ```python
-MAX_NODES = 250                   # hard array cap (main_vec.py)
-ADOPTION_CAP = 200                # adoption switches from APPEND to REPLACE here
+MAX_NODES = 500                   # hard array cap (main_vec.py)
+ADOPTION_CAP = 500                # adoption skips when listener at this cap
+                                  # (no REPLACE — see communication_phase)
+K_GRAFT = 10                      # BFS depth-limit for subgraph adoption
 ```
 
 Each agent's graph is a row in `(N, MAX_NODES, MAX_SEQ_LEN)` arrays:
@@ -1013,43 +1031,76 @@ Each agent samples K random peers, scores themselves and each peer using their o
 
 ### `communication_phase` (`main_vec.py`)
 
-```python
-def communication_phase(s, graphs, n_nodes_arr, weights, Q, rng,
-                        roots=None, mating_matrix=None, K=ref.K_SAMPLE):
-    talker_mask = s['is_in_camp'] & s['talk_request']
-    listener_mask = s['is_in_camp'] & s['listen_request']
-    s['talk_request'][:] = False
-    s['listen_request'][:] = False
-    talker_idx = np.flatnonzero(talker_mask)
-    listener_idx = np.flatnonzero(listener_mask)
-    if not talker_idx.size or not listener_idx.size: return 0, 0, 0
-    
-    talker_node = (rng.random(n_talks) * n_nodes_arr[talker_idx]).astype(np.int32)
-    adopt = s['adopt_rate'][listener_idx]
-    rolls = rng.random(n_listens)
-    adopters = listener_idx[rolls < adopt]
-    ...
-    # softmax-pick a talker per adopter using social score
-    scores = ...   # uses weights, Q, features, mating_matrix
-    pick = (r < cum).argmax(axis=1)
-    src_agents = chosen_t_global[np.arange(adopters.size), pick]
-    src_nodes  = talker_node[chosen_t_local[...]]
-    
-    # APPEND mode if room, REPLACE mode if at adoption cap
-    has_room = n_nodes_arr[adopters] < ADOPTION_CAP
-    ...
-```
+Cultural transmission is **K=10 subgraph adoption** (no longer single-node).
+Each accepting listener clones a whole BFS subgraph from the chosen talker —
+modeling the idea that culture spreads as *rituals* / coordinated multi-node
+practices, not isolated atoms.
 
 Flow:
-1. **find talkers and listeners** — agents who fired `agent_talk` and `agent_listen` actions this hour while in camp
-2. **each talker exposes a random node from their graph**
-3. **each listener (per their adopt_rate) softmax-picks a talker** using their own social-ranking weights
-4. **Adoption mode**:
-   - **APPEND** (if `n_nodes < ADOPTION_CAP`): create a new python node with the source's content, splice it into one randomly-chosen edge of an existing node. Existing `A → B` becomes `A → new → B`.
-   - **REPLACE** (if at cap): overwrite the content of a randomly-chosen existing node with the source's content (preserving edges).
-5. **Sync flat ↔ object**: re-flatten the listener's row from the now-modified object graph; re-anchor `cur` to the same python-node identity in the new flat indexing.
+1. **find talkers and listeners** — agents who fired `agent_talk` /
+   `agent_listen` actions this hour while in camp.
+2. **each talker exposes a random node from their graph** (the "topic").
+3. **each listener (per their adopt_rate) softmax-picks a talker** using
+   their own social-ranking weights (cross-camp talkers are −∞'d so
+   adoption stays within-camp).
+4. **Subgraph adoption**:
+   - BFS up to `K_GRAFT=10` nodes outward from the exposed talker-node in
+     the talker's Python object graph.
+   - If listener has headroom (`n_nodes + K ≤ MAX_NODES`):
+       - Deep-clone the K-node subgraph into the listener's object graph.
+         Internal edges (target inside the K-set) are wired to the
+         corresponding clone. External "exit" edges (target outside the
+         K-set) are rewired to the listener's *splice-target* — the node
+         at the other end of the edge we're about to redirect.
+       - Splice listener's chosen edge to point at the subgraph entry.
+   - If listener is at the cap: **the adoption silently skips**. No
+     REPLACE — earlier versions overwrote random existing nodes, but
+     that was destroying basal-survival nodes (eat/sleep) and
+     bottlenecking the population. Now adoption is purely additive,
+     and slot reclamation is handled by cultural-memory decay (§9b).
+5. **Sync flat ↔ object**: `reflatten_row` re-DFS's the listener's graph
+   into the numpy arrays. `cur` is re-anchored via Python-node identity.
+   `node_freshness` is carried through via `reindex_freshness` (§9b).
 
-The re-flatten is critical — `flatten_graph` uses DFS order from root, so flat indices change after each adoption. Re-anchoring `cur` via python-node identity preserves the agent's program counter through these renumberings.
+The re-flatten is critical — `flatten_graph` uses DFS order from root, so
+flat indices change after each adoption. Re-anchoring `cur` and freshness
+via Python-node identity preserves both the agent's program counter and
+its cultural-memory state through these renumberings.
+
+### 9b. Cultural memory: per-node freshness + daily GC
+
+Every graph node has a per-agent `freshness` counter (`s['node_freshness']`,
+shape `(N, MAX_NODES)`, int16). Refreshed to `FRESHNESS_MAX=168` (one week
+of hours) every time the agent's chain-walk visits the slot in `step_all`'s
+hot loop. Decayed by `FRESHNESS_DECAY=1` per hour everywhere else.
+
+Once per simulated day (`GC_INTERVAL_HOURS=24`), `gc_dead_nodes` prunes
+every slot whose freshness has decayed to 0 (except the chain root at
+slot 0, which is preserved structurally):
+
+1. For each agent, identify dead-slot Python nodes.
+2. Redirect every incoming edge (in `roots[i]`) that targets a dead node
+   to instead target the dead node's `true_node` — skipping it.
+3. Re-flatten the row. Unreachable-from-root dead nodes drop out of the
+   new DFS, freeing slots and shrinking `n_nodes_arr[i]`.
+4. `reindex_freshness` carries the surviving slots' freshness through
+   to the new DFS layout via Python-node identity.
+5. `cur` is re-anchored the same way.
+
+This is the **forgotten-because-unwalked** mechanism. Nodes the agent's
+chain trajectory never actually reaches age out; nodes on the
+walked-every-cycle critical path stay fresh. Combined with the no-REPLACE
+adoption rule, it gives the population a regulated cultural-turnover
+mechanism: practices that are *used* persist, practices that are *not*
+fade, slots reopen for new adoptions to splice in. Mirrors real cultural
+disuse extinction (you forget rituals you stop performing).
+
+Caveat: nothing protects basal-survival actions (eat, sleep, hunt, etc.)
+from freshness decay specifically — if a chain trajectory happens to
+route around them for `FRESHNESS_MAX` hours, those nodes will be reaped.
+Mutation's `swap_actions` mode is the more dangerous failure path here
+(turning eat into a no-op rather than removing it), and selection on
+mutation rate is left to handle it.
 
 ### `mating_phase` (with incest gate)
 
@@ -1340,7 +1391,82 @@ The 11th linear weight (`family_w`) is what selection acts on. A clannish agent 
 
 ---
 
-## 14. The dump format
+## 14. Multi-camp system
+
+Agents are partitioned into camps by an int `camp_id`, with `camp_id = -1` reserved as the **wanderer sentinel** (unaffiliated, in the wild). Each real camp has its own larder (`camp_caches: dict[int, float]`); the wanderer pool has no larder. All within-camp interactions (mating, gifting, communication adoption, watching, deposit, withdraw) are gated on **same `camp_id`** *and* (for interactions) **both currently `is_in_camp = True`**.
+
+The model maintains a strict invariant: **`is_in_camp ↔ (camp_id != -1)`**. To go foraging in the wild you must drop affiliation first; rejoining the world means committing to a camp.
+
+### Three-stage migration
+
+- **`agent_leave_camp`** — drops the agent into the wild: sets `camp_id = -1` and `is_in_camp = False` atomically. Only affiliated agents can leave. Kids in the FORAGE..WATCH age band can only leave when at least one adult is already a wanderer (tag-along).
+- **`agent_make_camp`** — sets `make_camp_request`. Resolved in `make_camp_phase`: filter to wanderers only (so a stale request from an agent who fired both join and make in the same hour doesn't orphan them from the camp they just joined), allocate a fresh `camp_id` from a monotonic counter, set the agent's `is_in_camp = True`, initialize the new camp's cache to 0.
+- **`agent_join_camp`** — sets `join_camp_request`. Resolved in `join_camp_phase`: filter to wanderers (`camp_id < 0`), then pick a real camp via softmax with **preferential-attachment size weighting**:
+  - Candidate set capped at `JOIN_CAMP_CANDIDATE_CAP=12` via Efraimidis–Spirakis weighted sampling with weight `camp_size^JOIN_CAMP_SIZE_WEIGHT`, so big camps are *more likely to be considered* (not just preferred once shortlisted).
+  - Final score per camp = `mean(social_score over K-sample of members) / JOIN_CAMP_TEMPERATURE + JOIN_CAMP_SIZE_WEIGHT * log(camp_size)`. Softmax picks the winner.
+  - Result: `P(join camp c) ∝ exp(social_c / T) * size_c^SIZE_WEIGHT`. With `SIZE_WEIGHT=1.0`, this is canonical Barabási–Albert preferential attachment combined with social-affinity ranking. Temperature only affects the social term — size weight is stable across temp changes.
+  - On pick: reassign `camp_id`, set `is_in_camp = True`.
+  - **Fallback**: if no real camps exist yet (typical in the first few hours), the join request transparently becomes a make — each requester founds a fresh camp.
+
+### Canonical gates (initially stochastic)
+
+The starting behavior tree uses pure rng gates for all three migration actions — clustering vs nomadism is left for memetic mutation to evolve:
+
+- `leave_camp_node.seq = [hunger > 1500, rng > 0.999, is_in_camp == True]` (links: `[LINK_OR, LINK_AND]`): leaves either because hungry (same threshold as `withdraw`, so larder-raid and foraging-trip are alternatives at the same pressure) or on a *rare* random whim (~0.1%/visit). The whim rate is intentionally stricter than make/join so affiliation remains a **Markov sink** — without that asymmetry, agents bounce between states fast enough that kids pile up exposure deaths (CHILD_OUT_CAMP_LIMIT = 1 hour).
+- `make_camp_node.seq = [is_in_camp == False, rng > 0.99996667]` (LINK_AND): wanderers found new camps very rarely — threshold tuned so per-chain-pass (3 clones) fire probability ≈ 1/10,000. Making a new camp from scratch is a much rarer event than joining one. Mutation can drift this much lower if fissioning into smaller camps proves fitter.
+- `join_camp_node.seq = [is_in_camp == False, rng > 0.99]` (LINK_AND): wanderers join existing camps frequently (~1%/visit, 100× more often than make). Chain order is `join_camp` before `make_camp`. When join fires but no real camps exist, it **falls back to make** so a wanderer's "I want to settle" intent is never wasted.
+
+### Phase resolution order
+
+Each hour after `step_all` sets the migration request flags:
+
+1. **`join_camp_phase` runs first**, filtered to wanderers (`camp_id < 0`). It softmax-picks an existing camp by social score, or falls back to allocating a fresh camp if none exist. Both outcomes set `is_in_camp = True`.
+2. **`make_camp_phase` runs second**, also filtered to wanderers. Any agent still wandering with a make-request founds a fresh camp.
+
+Filtering both phases to wanderers prevents the same agent from being processed twice when they fire both requests in one hour (which the chain order makes possible).
+
+### Camp lifecycle
+
+- All founders start as wanderers (`camp_id = -1`, `is_in_camp = False`, `camp_caches = {}`, `next_camp_id = 0`). Camps form entirely via in-sim `make_camp` actions, seeded by the join→make fallback on the first hours of the run. The birth-window safety net keeps the bootstrap phase from spawning wild newborns (any near-term pregnant wanderer is force-settled before delivery).
+- New camps start with cache = 0. They must accumulate deposits or absorb new members from `join_camp` to grow.
+- Newborns inherit `mom.camp_id`, including the `-1` sentinel — kids born to a wandering mom are wanderers themselves (and will suffer watching-phase neglect, which is realistic selection pressure against giving birth in the wild).
+- `cleanup_empty_camps` runs after every hour's deaths: any real camp with zero members is destroyed; its cache is discarded. The wanderer sentinel is never inserted into `camp_caches`.
+- `next_camp_id` is monotonic — never reused, so a brand-new camp can't accidentally inherit a defunct camp's history.
+
+### Action handlers that respect the invariant
+
+`agent_sleep` and `agent_go_to_camp` both used to set `is_in_camp = True` unconditionally; both are now gated on `camp_id >= 0` so wanderers can sleep/walk in the wild without spuriously becoming affiliated.
+
+### Per-camp deposit/withdraw (in `_apply_actions`)
+
+Deposits bin by `s['camp_id']` and credit each agent's amount to `camp_caches[their_camp]`. Withdraws are pro-rated per camp — each camp's withdrawers split that camp's larder independently. With insufficient larder, the pro-rata ratio scales everyone down.
+
+### Within-camp filter implementation
+
+- **`mating_phase`** pre-filters the proposer pool by `same camp_id AND target is_in_camp` *before* the kin filter. Mating refused if either fails.
+- **`gift_phase`** restricts the recipient pool to in-camp same-camp agents.
+- **`communication_phase`** masks the talker softmax to set non-same-camp talker scores to −∞ before normalization. Adopters with no same-camp talker in their K-sample are dropped.
+- **`watching_phase`** loops over `np.unique(camp_id)` and runs the in-camp / out-camp watcher-feeds-kids pool independently per camp.
+
+### Constants
+
+```python
+CAMP_INIT_CACHE = 0.0              # founder camp starts empty; deposits build it
+JOIN_CAMP_TEMPERATURE = 1.0        # softmax temp for join_camp
+```
+
+### Dump format additions
+
+- Each agent's state dict gets `'camp_id': int`.
+- Top-level `payload['camps'] = [{'id': int, 'cache': float}, ...]`.
+
+### Rationale
+
+Single-camp runs hit founder-effect → kinship-saturation extinction (incest gate refused 66% of mate pairs by yr 105 in one observed run). Multi-camp sub-structures the breeding pool; differential drift across camps preserves lineage diversity; `join_camp` provides a migration channel so isolated camps can mix when one becomes preferable.
+
+---
+
+## 15. The dump format
 
 ```python
 def dump_population(path, day, state, weights, Q, roots, mating_matrix=None,
@@ -1369,7 +1495,7 @@ The `analyze.py` script reads these dumps and produces aggregate cohort/culture/
 
 ---
 
-## 15. Adaptive rates math
+## 16. Adaptive rates math
 
 ```python
 _LOG_HIGH_MUT = math.log(ADAPTIVE_MUT_HIGH)                                        (main.py:933)
@@ -1388,19 +1514,68 @@ Sigmoid on `delta = self_score - peer_mean`. Mut rate log-interpolates between `
 
 The clip at ±50 prevents overflow but also caps the dynamic range. With the NDF_DECAY fix, normal `delta` values stay in the responsive [−5, +5] range and the sigmoid actually does work.
 
+**Peer pool is per-camp.** `update_adaptive_rates` samples K peers from the agent's *own camp* (excluding self). The "relevant social context" for the self-rank delta is the people you actually interact with daily, not a global slice. This matters for multi-camp diversity: a splinter-camp member calibrates their cultural-conservation knobs against their splinter-mates, so the camp can drift culturally without the founder being pinned to camp-0's averages. Singletons (camps with no other members) fall back to sampling globally, since there's no within-camp peer to compare against.
+
+---
+
+## 17. Visualization (`viz.py`)
+
+`python viz.py [week_NN]` runs all plots against one dump (defaults to the latest) plus a population-level trajectory across all dumps. Outputs land in `viz/<week>/`.
+
+Per-week plots:
+- **`family_clusters.png`** — pairwise crest-similarity matrix with single-linkage clan groups annotated.
+- **`cohort_cohesion.png`** — cosine similarity between cohort-mean weight vectors. Diagonal-strong = cohorts internally agree; off-diagonals show generational drift.
+- **`population_pyramid.png`** — age × sex demographics with overlaid hunger/pregnancy indicators.
+- **`resource_distributions.png`** — cache + hunger histograms by life-stage.
+- **`weight_heatmap.png`** — cohort × ranking-feature mean weight grid. Cells show `mean±std` so intra-cohort cultural variance is visible (tight ±0.05 = consensus, loose ±0.4 = split opinion).
+- **`action_by_sex.png`** — sex × cohort × action true_action frequencies + cross-sex gift/mating matrices.
+- **`camp_density.png`** — camp-size histogram + larder distribution.
+- **`time_of_day_actions.png`** — population-aggregated daily rhythm. Replays each sampled agent's chain through 24 hours against their dumped state (state held frozen — captures time-gated patterns accurately but not state-evolution). Stacked-area by semantic category (sleep/forage/eat/migrate/social/economic) plus per-action heatmap. Reveals emergent diurnal patterns: synchronized "meeting hours" (chain-position-as-circadian-clock), morning social burst before differential foraging-departure, etc.
+- **`time_of_day_by_camp.png`** — same as above but as small-multiples grid, one panel per top-N camps. Shows inter-camp cultural divergence in daily schedules.
+- **`camp_encounters.png`** — two histograms: per-agent passive camp-mate count vs distinct active social-tie partners (gift + mating). Captures realized social-pool size — Dunbar-style.
+- **`ties_by_sex_age.png`** — heatmap grid (rows: M/F, cols: age cohort) showing mean distinct partner count per cell. Three panels: mating partners, gift partners, union. Reveals life-stage shape of the social network (grandmother-effect signal: F partner count climbs into old age while M's plateaus or declines).
+
+Across-dumps plots:
+- **`viz/population_trajectory.png`** — population + mean hunger over time.
+- **`viz/mating_sex_composition.png`** — M-F / M-M / F-F mating-pair mass per agent over time, normalized by pop. Top panel: absolute per-capita rates; bottom: stacked composition fractions. Useful for tracking shifts in homosocial vs reproductive bonding under selection pressure.
+
+The time-of-day replay (`_replay_agent_day`) uses a Python re-implementation of `_eval_seqs` so it works directly from the dump JSON without needing main_vec's numpy machinery. State is held frozen during the replay — accurate for time-gated patterns, approximate for state-evolving ones.
+
+---
+
+## 18. Lineage tracking & pop-gen analyses (`lineage_analysis.py`)
+
+Every `node` carries a `lineage: int` field — a heritable variant ID treated as the "allele" at that position in the decision graph. Stamping rules:
+
+- **Canonical seed nodes** each get a unique founding lineage (IDs 1..N_canonical) at module-import time.
+- **Content-changing mutations** (chunk-level, seq-level, node-level, or whole-graph dual via `mutate()`) → fresh ID via `_new_lineage()` on the affected node(s). Pure weight mutations (`mutate_weights`) do *not* bump node lineage — they're separate from the graph-structure substrate.
+- **Cloning** (`clone_graph`, the duplicate branch of `mutate_node`, birth via `clone_graph(_dad_graph_snapshot)`) preserves lineage unchanged.
+- **Memetic transmission** (`assimilate_node` and the subgraph adoption path in `main_vec.py:communication_phase`) → target inherits source's lineage. This is what makes the system *memetic* — the same lineage can spread horizontally, not just vertically.
+
+`serialize_graph` emits `lineage` per node so `dumps/week_*.json` carry the data. `lineage_analysis.py` reads the dump series and produces:
+
+- **`viz/sfs_over_time.png`** — allele-frequency-spectrum heatmap. X = sim day; Y = log-spaced carrier-count bins (how many agents currently hold a given lineage); color = log10(# distinct lineages in that bin). Bottom row bright + dim top = healthy diversity. Bright diagonal streak migrating up-right = a selective sweep. Sudden top-row dimming = founder lineages going extinct.
+- **`viz/sweep_trajectories.png`** — top-20 candidate sweeps (lineages that started <5% carrier frequency and rose past 50%), each plotted as a frequency-vs-time line. Companion summary table prints estimated per-day selection coefficient *s* from the rising-portion slope (logistic fit between the 10% and 90% crossings).
+
+This is the foundation for further pop-gen ports — phylogenies, Fst between camps, linkage disequilibrium, heritability — all unlock from this same `lineage` field if/when needed.
+
 ---
 
 ## Things that are NOT obvious
 
 1. **Two graph representations co-exist**: object graphs (in `roots[i]`) for mutation, cloning, and serialization; flat numpy arrays (`graphs` dict) for the hot loop. They're synchronized via `reflatten_row` after every change.
 
-2. **`cur` is preserved through re-flattens** by remapping via python-node identity. Mutation never deletes nodes, so the lookup always succeeds.
+2. **`cur` is preserved through re-flattens** by remapping via python-node identity. Subgraph adoption + GC change the DFS order, so the lookup is non-trivial — `reindex_freshness` does the same trick for the per-node freshness counters.
 
 3. **Three pairwise matrices** (mating, gift, family-crest) — each contributes a column to the social-score feature vector. Mating and gift both decay each hour (30-day half-life); family-similarity is computed on the fly from per-agent crests and never decays.
 
-4. **The canonical idle redirects to root** so persistent `cur` doesn't trap agents. Without this the population collapses.
+4. **The canonical idle redirects to `tired_make_camp_node` (chain head)** so persistent `cur` doesn't trap agents and so the head gate (which force-settles tired/nighttime wanderers) is revisited each cycle. Without this the population would either collapse (cur traps) or have exposure deaths (tired wanderers sleeping in the wild).
 
-5. **Same-sex mating is allowed** (recorded in mating_events) but only opposite-sex pairs whose mom passes the fertility check produce pregnancies (`PREGNANCY_BIRTH_P = 0.75`). The mating_matrix preserves all matings regardless of sex.
+5. **Same-sex mating is allowed** (recorded in mating_events even during pregnancy — the latest revision lets pregnant females also pair-bond) and updates the mating_matrix, but only opposite-sex pairs whose mom passes the fertility check (`is_pregnant == False AND is_menopausal == False`) and clears `PREGNANCY_BIRTH_P` produce pregnancies. The mating_matrix preserves all bonds regardless of sex — so social and reproductive bonding are decoupled.
+
+6. **Out-camp = unaffiliated** (`camp_id = -1`). Forage requires `is_in_camp = False` (you can't hunt while at camp). So leaving to forage *is* becoming a wanderer. To rejoin camp life you must explicitly `make_camp` or `join_camp`. The `tired_make_camp_node` chain head force-settles wanderers at nightfall to prevent exposure-death cascades. Pregnant females in the last week of pregnancy and the first week post-partum are also forced to settle (`birth_window_force_settle_phase`) to prevent newborn deaths in the wild.
+
+7. **Cultural-memory decay** (§9b): per-node freshness counters tick down each hour; visited nodes refresh. Daily GC reaps dead nodes. This bounds graph bloat from subgraph adoption (K=10 per accepted adoption) without losing nodes that are actually in use. The trade-off is that a chain trajectory routing around a node for `FRESHNESS_MAX` consecutive hours kills it — including, in principle, basal-survival nodes. Selection on mutation rate is the safety net.
 
 6. **`step_all` skips forced-sleep agents** by gating every effect with `walking = forced_sleep_hours == 0`. They still pay metabolism — but in `forced_sleep_step` rather than per-visit.
 
