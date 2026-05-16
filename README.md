@@ -48,4 +48,5 @@ python3 archetypes.py                       # archetypal value-coalitions (requi
 
 If you're editing simulation *semantics*, look in `main_vec.py`. If you're editing *constants, the canonical graph, mutation/clone logic, or social scoring*, look in `main.py`. If you're editing the *driver, init, or dump cadence*, look in `run_vec.py`.
 
-See [`CULTURE.md`](CULTURE.md) for notes on the cultural-attractor regimes observed across population sizes.
+## Note on AI Usage
+This project was coded with assistance from Claude Opus 4.7
